@@ -1,0 +1,512 @@
+
+# Libraries
+```{r}
+library(Seurat)
+library(SeuratDisk)
+library(SeuratObject)
+library(zellkonverter)
+library(tidyverse)
+library(readr)
+library(Matrix)
+library(patchwork)
+library(IsoformSwitchAnalyzeR)
+library(gridExtra)
+library(remotes)
+library(scMiko)
+library(mclust)
+install.packages("clustree")
+library(clustree)
+library(ape)
+library(patchwork)
+
+```
+# Load the .h5ad and subset
+```{r}
+url <- "https://figshare.com/ndownloader/articles/24843948/versions/2"
+if (!dir.exists("data")) {
+  dir.create("data")  # Create the 'data' directory if it doesn't exist
+}
+destfile <- file.path("data", "normed_genecode.h5ad") 
+download.file(url, destfile, mode = "wb")
+full_dataset <- readH5AD("../data/normed_genecode.h5ad", reader = "R" )
+
+```
+
+# Load in the .h5ad and convert it to Seurat so we keep the metadata and the ICM
+```{r}
+full_dataset <- readH5AD("../data/normed_genecode.h5ad")
+
+#data <- readH5AD("../data/TSP2_Blood/TSP2_Blood.h5ad")
+
+seu_full <- as.Seurat(full_dataset, counts = "X", data = "log1p") # we insert count data in the  counts and log1p in the data slot. FindVariableFeatures function uses the COUNTS slots and that's why it's important that the data in that slot is in LINEAR space
+
+Idents(seu_full) <- "free_annotation"
+table(Idents(seu_full))
+```
+
+#  Rename free annotation classes
+```{r}
+# Stash cell identity classes in metadata
+seu_full[["old.ident"]] <- Idents(object = seu_full)
+
+# Rename identity classes
+seu_full <- RenameIdents(object = seu_full,
+                        "Memory B cell" = "memory b cell",
+                      "dendritic cell"  = "dendritic cells" 
+                        )
+```
+
+# Subset
+```{r}
+seu_1 <- subset(seu_full, idents = c("B cell", "memory b cell", "naive b cell",  "NK cell", "CD4 Helper T cell", "cd4-positive, alpha-beta memory t cell", "cd8-positive, alpha-beta memory t cell", "CD8 t cell", "NK cell","mature nk t cell", "monocyte", "macrophage", "dendritic cells"))
+
+seu_1[["active.ident"]] <- Idents(object = seu_1)
+
+seu_1 <- balanceSamples(seu_1, group = "active.ident", balance.size = 100)
+
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+seu_1 <- readRDS(file ="../data/balanced/seurat.rds")
+```
+
+
+
+
+# Calculate GCM and IFM from isoform abundance matrix with IsoformSwitchAnalyzeR package :) 
+```{r}
+row_metadata <- seu_1@assays$originalexp@meta.features
+isoform_ids <- rownames(row_metadata)
+gene_ids <- row_metadata$gene_ID
+
+# Create a GRanges object as isoformGeneAnnotation obj with meta-columns
+gr <- GRanges(seqnames = Rle(rep("chr", length(isoform_ids))),
+              ranges = IRanges(start = 1, end = 1),
+              strand = NULL,
+              isoform_id = isoform_ids,
+              gene_id = gene_ids)
+
+
+GCM_counts <-  isoformToGeneExp(
+    isoformRepExpression = seu_1@assays[["originalexp"]]@counts ,
+    isoformGeneAnnotation = gr,
+    quiet = FALSE
+)
+GCM_data <-  isoformToGeneExp(
+    isoformRepExpression = seu_1@assays[["originalexp"]]@data ,
+    isoformGeneAnnotation = gr,
+    quiet = FALSE
+)
+
+IFM_counts <- isoformToIsoformFraction(
+    isoformRepExpression = seu_1@assays[["originalexp"]]@counts,
+    geneRepExpression= GCM_counts ,
+    isoformGeneAnnotation= gr,
+    quiet = FALSE
+)
+
+IFM_data <- isoformToIsoformFraction(
+    isoformRepExpression = seu_1@assays[["originalexp"]]@data,
+    geneRepExpression= GCM_data ,
+    isoformGeneAnnotation= gr,
+    quiet = FALSE
+)
+
+gcm_assay<- CreateAssay5Object(counts =  (Matrix::Matrix(as.matrix(GCM_counts),sparse = T)) , data =  (Matrix::Matrix(as.matrix(GCM_data),sparse = T)) )
+
+ifm_assay <- CreateAssay5Object(counts =  (Matrix::Matrix(as.matrix(IFM_counts),sparse = T)) , data =  (Matrix::Matrix(as.matrix(IFM_data),sparse = T)) )
+
+
+seu_1[["GCM"]] <-  gcm_assay
+
+seu_1[["IFM"]] <- ifm_assay
+seu_1@assays$IFM$scale.data <- seu_1@assays$IFM$data
+
+
+rm(ifm_assay,gcm_assay, IFM_data, GCM_data, GCM_counts, IFM_counts, gr)
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+```
+
+############ GCM analysis #############
+
+```{r}
+seu_1 <- readRDS(file ="../data/balanced/seurat.rds")
+
+```
+
+```{r}
+
+DefaultAssay(seu_1) <- 'GCM'
+
+# Identify high variable isoforms
+seu_1 <- FindVariableFeatures(seu_1)
+top10 <- head(VariableFeatures(seu_1),10)
+plot <- VariableFeaturePlot(seu_1)
+LabelPoints(plot, points = top10, repel = TRUE)
+ggsave(filename = "/Users/annamelidi/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/VariableFeatures.jpeg" )
+
+# Scaling
+all.genes <- rownames(seu_1)
+seu_1 <- ScaleData(seu_1, features= all.genes )
+
+
+# Linear dimens reduction 
+seu_1 <- RunPCA(seu_1, features = VariableFeatures(seu_1), reduction.name = 'gpca')
+#print(seu_1[["gpca"]], dims = 1:5, nfeatures = 5 )
+
+DimHeatmap(seu_1, dims = 1, cells = 1000, balanced = TRUE, reduction = "gpca", fast=FALSE)
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/DimHeatmap.jpeg", plot = last_plot(), device = "jpeg")
+
+
+# Determine dimensionality of the data
+ElbowPlot(seu_1,  reduction = "gpca") # After considering the elbow plot choose around 10 dimensions
+ggsave(filename = "/Users/annamelidi/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/ElbowPlot.jpeg" )
+
+# Clustering
+seu_1 <- FindNeighbors(seu_1, dims = 1: 15, reduction = "gpca" ) # 15
+
+# understanding resolutiom
+seu_1 <- FindClusters(seu_1, resolution = c(0.8, 1.2, 1.6, 2), verbose = FALSE)
+plot <- clustree(seu_1, show_axis = TRUE) + guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10, dpi = 300)
+
+plot <- DimPlot(seu_1, group.by = "GCM_snn_res.2", label = TRUE, alpha = 0.3, repel = TRUE ) + ggtitle("Res 2") 
+plot_gt <- DimPlot(seu_1, group.by = "active.ident", label = TRUE , alpha = 0.3, repel = TRUE)
+# Create the combined plot
+combined_plot <- plot_gt | plot
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/PCA_snn_res.2.jpeg", plot = last_plot(), device = "jpeg")
+
+# setting identity of clusters
+Idents(seu_1)
+Idents(seu_1) <- "GCM_snn_res.2" 
+
+# Rank Index
+adj.rand_g <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+
+# UMAP
+seu_1 <- RunUMAP(seu_1, dims = 1:15, reduction = "gpca" , reduction.name = "umap.genes") 
+
+# DimPlot with group.by argument
+plot_gt <- DimPlot(seu_1, reduction = "umap.genes",
+                           group.by = "active.ident",
+                           label = FALSE,
+                           repel = TRUE,
+                   alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/umap_free_annot.jpeg", plot = last_plot(), device = "jpeg", height = 10, width = 10)
+
+plot <- DimPlot(seu_1, reduction = "umap.genes",
+                           group.by = "GCM_snn_res.2",
+                           label = TRUE,
+                           repel = TRUE,
+                   alpha = 0.5) 
+
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/GCM/umap_res_2.jpeg", plot = last_plot(), device = "jpeg")
+
+# Check if we have underrepresented populations..
+table(seu_1@meta.data$active.ident)
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+
+```
+
+
+
+############ Isoform Analysis  #############
+
+```{r}
+
+DefaultAssay(seu_1) <- 'originalexp'
+
+# Identify high variable isoforms
+seu_1 <- FindVariableFeatures(seu_1)
+#top10 <- head(VariableFeatures(seu_1),10)
+#plot1 <- VariableFeaturePlot(seu_1)
+#LabelPoints(plot = plot1, points = top10, repel = TRUE)
+#ggsave(filename = "/Users/annamelidi/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/VariableFeatures.jpeg" )
+
+# S. Scaling
+all.isof <- rownames(seu_1)
+seu_1 <- ScaleData(seu_1, features= all.isof)
+
+# Linear dimens reduction 
+seu_1 <- RunPCA(seu_1, features = VariableFeatures(seu_1), reduction.name = 'ispca')
+#print(seu_1[["ispca"]], dims = 1:5, nfeatures = 5 )
+
+DimHeatmap(seu_1, dims = 1, cells = 1000, balanced = TRUE, reduction = "ispca", fast=FALSE)
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/DimHeatmap.jpeg", plot = last_plot(), device = "jpeg")
+
+# Determine dimensionality of the data
+ElbowPlot(seu_1,  reduction = "ispca") # After considering the elbow plot shoose around 10 dimensions
+ggsave(filename = "/Users/annamelidi/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/elbow.jpeg" )
+
+# Clustering
+seu_1 <- FindNeighbors(seu_1, dims = 1: 15, reduction = "ispca" ) 
+
+# understanding resolutiom
+seu_1 <- FindClusters(seu_1, resolution = c(0.8, 1.2, 1.6), verbose = FALSE)
+
+plot <- clustree(seu_1, show_axis = TRUE) + guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+    
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width=9, height=9, dpi=300)
+
+
+plot <- DimPlot(seu_1, 
+                group.by = "originalexp_snn_res.2", 
+                label = FALSE , alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/PCA_snn_res.1.2.jpeg", plot = last_plot(), device = "jpeg",  width=9, height=9, dpi=300)
+
+# setting identity of clusters
+Idents(seu_1)
+Idents(seu_1) <- "originalexp_snn_res.2"
+
+# Rank Index
+adj.rand_is <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+
+
+# UMAP
+seu_1 <- RunUMAP(seu_1, dims = 1:15, reduction = "ispca" , reduction.name = "umap.iso") # 10
+
+plot_gt <- DimPlot(seu_1, reduction = "umap.iso",
+                   group.by = "originalexp_snn_res.2",
+                   label = TRUE, repel = TRUE, alpha = 0.5)
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/umap_res2.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10)
+
+plot_gt <- DimPlot(seu_1, reduction = "umap.iso",
+                   group.by = "active.ident",
+                   label = FALSE, repel = TRUE, alpha = 0.5)
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/umap_ann2.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10)
+
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+print("Seurat saved with genes and isoforms single modalities analysis in /data/balanced/seurat.rds")
+```
+
+
+```{r}
+
+
+```
+
+
+########    Isoform Fraction Analysis    #############
+```{r}
+# Replace NA values with 0 in the counts matrix
+seu_1@assays[["IFM"]]@layers[["counts"]]@x[is.na(seu_1@assays[["IFM"]]@layers[["counts"]]@x)] <- 0
+seu_1@assays[["IFM"]]@layers[["data"]]@x[is.na(seu_1@assays[["IFM"]]@layers[["data"]]@x)] <- 0
+
+DefaultAssay(seu_1) <- 'IFM'
+
+# Identify high variable isoforms
+seu_1 <- FindVariableFeatures(seu_1)
+
+# S. Scaling
+all.isof <- rownames(seu_1)
+seu_1 <- ScaleData(seu_1, features= all.isof)
+
+# Linear dimens reduction 
+seu_1 <- RunPCA(seu_1,features = VariableFeatures(seu_1), reduction.name = 'frpca')
+
+# Clustering
+#seu_1 <- FindNeighbors(seu_1, dims = 1: 10, reduction = "frpca" ) # 10
+
+# understanding resolutiom
+#seu_1 <- FindClusters(seu_1, resolution = c(0.1, 0.3), verbose = FALSE)
+
+#plot <- DimPlot(seu_1, group.by = "originalexp_snn_res.0.3", label = TRUE , alpha = 0.3 ) # Need feedback on that ~ 0.1- 4 clusters
+
+# setting identity of clusters
+#Idents(seu_1)
+#Idents(seu_1) <- "ifm_snn_res.0.1"
+
+# Rank Index
+#adj.rand <- adjustedRandIndex(seu_1@active.ident, seu_1@meta.data$active.ident)
+
+
+# UMAP
+#seu_1 <- RunUMAP(seu_1, dims = 1:10, reduction = "ispca" , reduction.name = "umap.iso") # 10
+#plot <- DimPlot(seu_1, reduction = "umap.iso", label = TRUE , repel = TRUE, alpha = 0.3)
+#plot_gt <- DimPlot(seu_1, reduction = "umap.iso", group.by = "free_annotation", label = FALSE, repel = TRUE, alpha = 0.3)
+#combined_plot <- plot +plot_gt
+#ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/ICM/umap.jpeg", plot = last_plot(), device = "jpeg")
+
+
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+print("Seurat saved with genes, isoforms and isoform fraction single modalities analysis in /data/balanced/seurat.rds")
+seu_1 <- readRDS("../data/balanced/seurat.rds")
+```
+
+
+
+
+############ GCM + isoforms  #############
+```{r}
+# Identify multimodal neighbors. These will be stored in the neighbors slot, 
+# and can be accessed using Seurat[['weighted.nn']]
+# The WNN graph can be accessed at test_Seurat[["wknn"]], 
+# and the SNN graph used for clustering at test_Seurat[["wsnn"]]
+# Cell-specific modality weights can be accessed at test_Seurat$gene.isoform.weight
+
+seu_1 <- FindMultiModalNeighbors(
+  seu_1, reduction.list = list("gpca", "ispca"), 
+  dims.list = list(1:13, 1:14), knn.graph.name = "gene_iso_wknn",
+  snn.graph.name = "gene_iso_wsnn",
+  weighted.nn.name = "gene.iso.weighted.nn",
+  modality.weight.name = 'gene.iso',)
+
+seu_1 <- FindClusters(seu_1, graph.name = "gene_iso_wknn", resolution = c(0.8, 1.2, 1.6,2), verbose = FALSE)
+
+plot <- clustree(seu_1,prefix =  "gene_iso_wknn_res.", show_axis = TRUE) +
+  guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10, dpi = 300)
+
+
+Idents(seu_1) <- "gene_iso_wknn_res.2" # feedback
+
+seu_1 <- RunUMAP(seu_1, nn.name = "gene.iso.weighted.nn", reduction.name = "gene.iso.umap")
+
+
+plot <- DimPlot(seu_1, reduction = 'gene.iso.umap',
+                group.by =  "gene_iso_wknn_res.2",
+                label = TRUE, repel = TRUE, label.size = 2.5, alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso/umap_res.2.jpeg", plot = last_plot(), device = "jpeg")
+
+plot <- DimPlot(seu_1, reduction = 'gene.iso.umap', group.by = 'active.ident', label = FALSE, repel = TRUE, alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso/umap_annot_res.2.jpeg", plot = last_plot(), device = "jpeg", height = 10, width = 10)
+
+
+adj.rand_g_is <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+```
+
+
+############ GCM + isoforms + isoFr #############
+```{r}
+seu_1 <- FindMultiModalNeighbors(
+  seu_1, reduction.list = list("gpca", "ispca", "frpca"), 
+  dims.list = list(1:15, 1:15, 1:15), knn.graph.name = "gene_iso_fr_wknn",
+  snn.graph.name = "gene_iso_fr_wsnn",
+  weighted.nn.name = "gene.iso.fr.weighted.nn",
+  modality.weight.name = 'GCM.weight originalexp.weight IFM.weight')
+
+seu_1 <- FindClusters(seu_1, graph.name = "gene_iso_fr_wknn",resolution = c(0.8, 1.2, 1.6,2), verbose = FALSE)
+
+plot <- clustree(seu_1, prefix = "gene_iso_fr_wknn_res.", show_axis = TRUE) +
+  guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso+IsoFr/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10, dpi = 300)
+
+
+seu_1 <- RunUMAP(seu_1, nn.name = "gene.iso.fr.weighted.nn", reduction.name = "gene.iso.fr.umap")
+
+
+plot <- DimPlot(seu_1, reduction = 'gene.iso.fr.umap',
+                group.by =  "gene_iso_fr_wknn_res.2",
+                label = TRUE, repel = TRUE, label.size = 2.5, alpha = 0.5
+                )
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso+IsoFr/umap_res_2.jpeg", plot = last_plot(), device = "jpeg")
+
+plot_gt <- DimPlot(seu_1, reduction = 'gene.iso.fr.umap', group.by = 'active.ident', label = FALSE, repel = TRUE, alpha = 0.6) + ggtitle("free_annotation")
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+Iso+IsoFr/umap_annot.jpeg", plot = last_plot(), device = "jpeg", width = 10, height = 10)
+
+adj.rand_g_iso_fr <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+print("Seurat saved with genes, isoforms and isoform fraction single and multiple modalities analysis in /data/balanced/seurat.rds")
+```
+
+
+############ GCM + isoFr #############
+```{r}
+seu_1 <- FindMultiModalNeighbors(
+  seu_1, reduction.list = list("gpca", "frpca"), 
+  dims.list = list(1:15, 1:15), knn.graph.name = "gene_fr_wknn",
+  snn.graph.name = "gene_fr_wsnn",
+  weighted.nn.name = "gene.fr.weighted.nn",
+  modality.weight.name = 'gene.fr',)
+
+seu_1 <- FindClusters(seu_1, graph.name = "gene_fr_wknn", resolution = c(0.8, 1.2, 1.6,2), verbose = FALSE)
+
+plot <- clustree(seu_1,prefix =  "gene_fr_wknn_res.", show_axis = TRUE) +
+  guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+isoFr/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10, dpi = 300)
+
+
+Idents(seu_1) <- "gene_fr_wknn_res.2" # feedback
+
+seu_1 <- RunUMAP(seu_1, nn.name = "gene.fr.weighted.nn", reduction.name = "gene.fr.umap")
+
+
+plot <- DimPlot(seu_1, reduction = 'gene.fr.umap',
+                group.by = "gene_fr_wknn_res.2",
+                label = TRUE, repel = TRUE, label.size = 2.5, alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+isoFr/umap_res_2.jpeg", plot = last_plot(), device = "jpeg")
+
+plot <- DimPlot(seu_1, reduction = 'gene.fr.umap', group.by = 'active.ident', label = FALSE, repel = TRUE, alpha = 0.5) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/G+isoFr/umap_annot_res.2.jpeg", plot = last_plot(), device = "jpeg",  height = 10, width = 10)
+
+
+adj.rand_g_fr <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+```
+
+
+
+
+############ isoforms + isoFr #############
+```{r}
+seu_1 <- FindMultiModalNeighbors(
+  seu_1, reduction.list = list("ispca", "frpca"), 
+  dims.list = list(1:15, 1:15), knn.graph.name = "iso_fr_wknn",
+  snn.graph.name = "iso_fr_wsnn",
+  weighted.nn.name = "iso.fr.weighted.nn",
+  modality.weight.name = 'iso.fr',)
+
+seu_1 <- FindClusters(seu_1, graph.name = "iso_fr_wknn", resolution = c(0.8, 1.2, 1.6,2), verbose = FALSE)
+
+plot <- clustree(seu_1,prefix =  "iso_fr_wknn_res.", show_axis = TRUE) +
+  guides(edge_colour = FALSE, edge_alpha = FALSE, edge_width = FALSE) +
+    theme(legend.position = "bottom")
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/iso+isoFr/cluster_tree.jpeg", plot = last_plot(), device = "jpeg", width = 10 , height = 10, dpi = 300)
+
+
+Idents(seu_1) <- "iso_fr_wknn_res.2" # feedback
+
+seu_1 <- RunUMAP(seu_1, nn.name = "iso.fr.weighted.nn", reduction.name = "iso.fr.umap")
+
+
+plot <- DimPlot(seu_1, reduction = 'iso.fr.umap',
+                group.by = c("iso_fr_wknn_res.1.6", "iso_fr_wknn_res.2"),
+                label = TRUE, repel = TRUE, label.size = 2.5, alpha = 0.3) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/iso+isoFr/umap_res.1.6_2.jpeg", plot = last_plot(), device = "jpeg")
+
+plot <- DimPlot(seu_1, reduction = 'iso.fr.umap', group.by = 'active.ident', label = FALSE, repel = TRUE, alpha = 0.3) 
+
+ggsave("~/Documents/DTU_courses/Special_courses/DTU_Health/images/iso+isoFr/umap_annot_res.2.jpeg", plot = last_plot(), device = "jpeg")
+
+
+adj.rand_iso_fr <- adjustedRandIndex(seu_1@active.ident,
+                          seu_1@meta.data$active.ident)
+write_rds(seu_1, file = "../data/balanced/seurat.rds")
+```
